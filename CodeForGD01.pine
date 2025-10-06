@@ -1,0 +1,203 @@
+//@version=6
+strategy("Optimized Multi-Regime Strategy",overlay=true,initial_capital=1000,default_qty_type=strategy.percent_of_equity,default_qty_value=100,calc_on_every_tick=false,calc_on_order_fills=false)
+
+// ===== ENHANCED INPUTS =====
+regime_length = input.int(30, "Regime Detection Length", minval=20, maxval=50)
+volatility_threshold = input.float(0.025, "Volatility Threshold", minval=0.015, maxval=0.04, step=0.005)
+trend_strength_threshold = input.float(0.8, "Trend Strength Threshold", minval=0.5, maxval=1.5, step=0.1)
+
+min_bars_per_trade = input.int(8, "Minimum Bars Per Trade", minval=5, maxval=20)
+max_trades_per_regime = input.int(2, "Max Trades Per Regime", minval=1, maxval=5)
+
+bb_length = input.int(20, "BB Length", group="Bollinger Bands")
+bb_mult = input.float(2.0, "BB Multiplier", group="Bollinger Bands", step=0.1)
+bb_rsi_filter = input.int(45, "BB RSI Filter", group="Bollinger Bands", minval=30, maxval=70)
+
+rsi_length = input.int(14, "RSI Length", group="RSI")
+rsi_overbought = input.int(75, "RSI Overbought", group="RSI", minval=65, maxval=85)
+rsi_oversold = input.int(25, "RSI Oversold", group="RSI", minval=15, maxval=35)
+rsi_neutral_high = input.int(60, "RSI Neutral High", group="RSI")
+rsi_neutral_low = input.int(40, "RSI Neutral Low", group="RSI")
+
+stoch_k = input.int(14, "Stochastic %K", group="Stochastic")
+stoch_d = input.int(3, "Stochastic %D", group="Stochastic")
+stoch_overbought = input.int(85, "Stoch Overbought", group="Stochastic")
+stoch_oversold = input.int(15, "Stoch Oversold", group="Stochastic")
+
+use_dynamic_sl = input.bool(true, "Use Dynamic Stop Loss", group="Risk Management")
+atr_multiplier = input.float(2.0, "ATR Stop Loss Multiplier", group="Risk Management", step=0.1)
+fixed_sl_pct = input.float(2.5, "Fixed Stop Loss %", group="Risk Management")
+use_trailing_stop = input.bool(true, "Use Trailing Stop", group="Risk Management")
+trailing_pct = input.float(1.5, "Trailing Stop %", group="Risk Management")
+
+// ===== VARIABLES =====
+var int entry_bar = na
+var int regime_trade_count = 0
+var int last_regime = 0
+var float entry_price = na
+var float highest_profit = 0.0
+
+// ===== CORE INDICATORS =====
+atr = ta.atr(14)
+ema_9 = ta.ema(close, 9)
+ema_21 = ta.ema(close, 21)
+ema_50 = ta.ema(close, 50)
+sma_200 = ta.sma(close, 200)
+
+volume_sma = ta.sma(volume, 20)
+volume_spike = volume > volume_sma * 1.5
+
+bb_basis = ta.sma(close, bb_length)
+bb_dev = bb_mult * ta.stdev(close, bb_length)
+bb_upper = bb_basis + bb_dev
+bb_lower = bb_basis - bb_dev
+bb_width = (bb_upper - bb_lower) / bb_basis
+
+rsi = ta.rsi(close, rsi_length)
+
+stoch_k_val = ta.stoch(close, high, low, stoch_k)
+stoch_d_val = ta.sma(stoch_k_val, stoch_d)
+
+// ===== ENHANCED REGIME DETECTION =====
+price_change_pct = ta.change(close, regime_length) / close[regime_length] * 100
+volatility = ta.stdev(ta.change(close), regime_length) / close
+trend_strength = math.abs(price_change_pct) / math.max(volatility, 0.001)  // Prevent division by zero
+
+strong_uptrend = close > ema_21 and ema_21 > ema_50 and ema_50 > sma_200 and price_change_pct > 2
+strong_downtrend = close < ema_21 and ema_21 < ema_50 and ema_50 < sma_200 and price_change_pct < -2
+sideways_market = math.abs(price_change_pct) < 1.5 and bb_width < 0.08
+
+// ===== REGIME CLASSIFICATION =====
+regime_1 = sideways_market and volatility < volatility_threshold and bb_width > 0.03
+regime_2 = strong_uptrend and trend_strength > trend_strength_threshold and rsi < rsi_overbought
+regime_3 = volatility > volatility_threshold and not strong_uptrend and not strong_downtrend
+regime_4 = strong_downtrend and trend_strength > trend_strength_threshold
+regime_5 = close > ema_21 and not strong_uptrend and not regime_1 and not regime_3
+
+current_regime = regime_1 ? 1 : regime_2 ? 2 : regime_3 ? 3 : regime_4 ? 4 : regime_5 ? 5 : 0
+regime_changed = current_regime != last_regime
+
+if regime_changed
+    regime_trade_count := 0
+    last_regime := current_regime
+
+// ===== ENTRY CONDITIONS =====
+valid_regime = current_regime > 0
+
+long_condition_1 = regime_1 and close <= bb_lower and rsi < bb_rsi_filter and volume_spike
+short_condition_1 = regime_1 and close >= bb_upper and rsi > (100 - bb_rsi_filter) and volume_spike
+
+long_condition_2 = regime_2 and rsi > rsi_neutral_low and rsi < rsi_neutral_high and close > ema_9 and volume_spike
+short_condition_2 = false
+
+long_condition_3 = regime_3 and ta.crossover(stoch_k_val, stoch_d_val) and stoch_k_val < (stoch_oversold + 5) and rsi < 50
+short_condition_3 = regime_3 and ta.crossunder(stoch_k_val, stoch_d_val) and stoch_k_val > (stoch_overbought - 5) and rsi > 50
+
+long_condition_4 = regime_4 and rsi < rsi_oversold and volume_spike
+short_condition_4 = regime_4 and rsi > rsi_neutral_high and close < ema_21
+
+long_condition_5 = regime_5 and rsi > rsi_neutral_low and rsi < rsi_overbought and close > ema_21
+short_condition_5 = regime_5 and rsi > rsi_overbought and close < ema_21
+
+long_condition = valid_regime and regime_trade_count < max_trades_per_regime and (long_condition_1 or long_condition_2 or long_condition_3 or long_condition_4 or long_condition_5)
+short_condition = valid_regime and regime_trade_count < max_trades_per_regime and (short_condition_1 or short_condition_2 or short_condition_3 or short_condition_4 or short_condition_5)
+
+bars_in_trade = strategy.position_size != 0 ? bar_index - entry_bar : 0
+can_enter = strategy.position_size == 0 or bars_in_trade >= min_bars_per_trade
+
+// ===== EXECUTE TRADES =====
+if long_condition and can_enter
+    strategy.entry("Long", strategy.long)
+    entry_bar := bar_index
+    entry_price := close
+    regime_trade_count := regime_trade_count + 1
+    highest_profit := 0
+    stop_price = use_dynamic_sl ? close - (atr * atr_multiplier) : close * (1 - fixed_sl_pct / 100)
+    strategy.exit("Long Exit", "Long", stop=stop_price)
+
+if short_condition and can_enter
+    strategy.entry("Short", strategy.short)
+    entry_bar := bar_index
+    entry_price := close
+    regime_trade_count := regime_trade_count + 1
+    stop_price = use_dynamic_sl ? close + (atr * atr_multiplier) : close * (1 + fixed_sl_pct / 100)
+    strategy.exit("Short Exit", "Short", stop=stop_price)
+
+// ===== EXIT CONDITIONS =====
+if strategy.position_size > 0
+    profit_pct = (close - entry_price) / entry_price * 100
+    if profit_pct > highest_profit
+        highest_profit := profit_pct
+
+    if use_trailing_stop and highest_profit > trailing_pct * 2
+        trail_stop = close * (1 - trailing_pct / 100)
+        strategy.exit("Long Trail", "Long", stop=trail_stop)
+
+    should_exit_long = false
+    if regime_1 and (close > bb_upper or rsi > 70)
+        should_exit_long := true
+    if regime_2 and (rsi > rsi_overbought or close < ema_21)
+        should_exit_long := true
+    if regime_3 and stoch_k_val > stoch_overbought
+        should_exit_long := true
+    if regime_4 and rsi > 60
+        should_exit_long := true
+    if regime_5 and rsi > rsi_overbought
+        should_exit_long := true
+
+    if should_exit_long and bars_in_trade >= min_bars_per_trade
+        strategy.close("Long", comment="Regime Exit")
+
+if strategy.position_size < 0
+    should_exit_short = false
+    if regime_1 and (close < bb_lower or rsi < 30)
+        should_exit_short := true
+    if regime_3 and stoch_k_val < stoch_oversold
+        should_exit_short := true
+    if regime_4 and (rsi < rsi_oversold or close > ema_21)
+        should_exit_short := true
+    if regime_5 and close > ema_21
+        should_exit_short := true
+
+    if should_exit_short and bars_in_trade >= min_bars_per_trade
+        strategy.close("Short", comment="Regime Exit")
+
+// ===== PLOTTING =====
+plot(ema_9, color=color.yellow, linewidth=1, title="EMA 9")
+plot(ema_21, color=color.orange, linewidth=2, title="EMA 21")
+plot(ema_50, color=color.red, linewidth=2, title="EMA 50")
+
+bb_upper_plot = plot(bb_upper, color=color.new(color.blue, 60), title="BB Upper")
+bb_lower_plot = plot(bb_lower, color=color.new(color.blue, 60), title="BB Lower")
+fill(bb_upper_plot, bb_lower_plot, color=color.new(color.blue, 95))
+
+plotshape(long_condition and can_enter, style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small, title="Long Signal")
+plotshape(short_condition and can_enter, style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small, title="Short Signal")
+
+bgcolor(regime_1 ? color.new(color.yellow, 98) : na, title="Regime 1")
+bgcolor(regime_2 ? color.new(color.green, 98) : na, title="Regime 2")
+bgcolor(regime_3 ? color.new(color.purple, 98) : na, title="Regime 3")
+bgcolor(regime_4 ? color.new(color.red, 98) : na, title="Regime 4")
+bgcolor(regime_5 ? color.new(color.blue, 98) : na, title="Regime 5")
+
+// ===== PERFORMANCE TABLE =====
+if barstate.islast
+    var table perf_table = table.new(position.top_right, 2, 6, bgcolor=color.white, border_width=1)
+    table.cell(perf_table, 0, 0, "Metric", bgcolor=color.gray, text_color=color.white, text_size=size.small)
+    table.cell(perf_table, 1, 0, "Value", bgcolor=color.gray, text_color=color.white, text_size=size.small)
+
+    table.cell(perf_table, 0, 1, "Current Regime", text_size=size.small)
+    regime_text = regime_1 ? "1-BB" : regime_2 ? "2-RSI↑" : regime_3 ? "3-Stoch" : regime_4 ? "4-RSI↓" : regime_5 ? "5-RSI→" : "None"
+    table.cell(perf_table, 1, 1, regime_text, text_size=size.small)
+
+    table.cell(perf_table, 0, 2, "Regime Trades", text_size=size.small)
+    table.cell(perf_table, 1, 2, str.tostring(regime_trade_count), text_size=size.small)
+
+    table.cell(perf_table, 0, 3, "Bars in Trade", text_size=size.small)
+    table.cell(perf_table, 1, 3, str.tostring(bars_in_trade), text_size=size.small)
+
+    table.cell(perf_table, 0, 4, "RSI", text_size=size.small)
+    table.cell(perf_table, 1, 4, str.tostring(math.round(rsi, 1)), text_size=size.small)
+
+    table.cell(perf_table, 0, 5, "BB Width", text_size=size.small)
+    table.cell(perf_table, 1, 5, str.tostring(math.round(bb_width * 100, 2)) + "%", text_size=size.small)
